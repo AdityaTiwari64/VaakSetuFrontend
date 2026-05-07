@@ -1,0 +1,524 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { arrayBufferToBase64, base64ToArrayBuffer } from "@/lib/audio-utils";
+import type {
+  AcousticData,
+  CallMetadata,
+  CallState,
+  ClientMessage,
+  PerformanceReport,
+  ReasoningOutput,
+  ServerMessage,
+} from "@/types";
+
+/* ------------------------------------------------------------------ */
+/*  Public state exposed by the hook                                   */
+/* ------------------------------------------------------------------ */
+export interface VoiceClientState {
+  isConnected: boolean;
+  isRecording: boolean;
+  callActive: boolean;
+  isAiSpeaking: boolean;
+  isAiMuted: boolean;
+  isThinking: boolean;
+  callState: CallState;
+  error: string | null;
+  metadata: CallMetadata | null;
+  transcript: string;
+  reasoning: ReasoningOutput | null;
+  acousticData: AcousticData | null;
+  callSummary: PerformanceReport | null;
+}
+
+export interface VoiceClientActions {
+  startCall: () => Promise<void>;
+  stopCall: () => void;
+  toggleTakeover: () => void;
+  analyserNode: React.RefObject<AnalyserNode | null>;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Hook                                                               */
+/* ------------------------------------------------------------------ */
+export function useVoiceClient(): VoiceClientState & VoiceClientActions {
+  /* ---- state ---- */
+  const [isConnected, setIsConnected] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [callActive, setCallActive] = useState(false);
+  const [isAiSpeaking, setIsAiSpeaking] = useState(false);
+  const [isAiMuted, setIsAiMuted] = useState(false);
+  const [isThinking, setIsThinking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [metadata, setMetadata] = useState<CallMetadata | null>(null);
+  const [transcript, setTranscript] = useState("");
+  const [reasoning, setReasoning] = useState<ReasoningOutput | null>(null);
+  const [callState, setCallState] = useState<CallState>("LISTENING");
+  const [acousticData, setAcousticData] = useState<AcousticData | null>(null);
+  const [callSummary, setCallSummary] = useState<PerformanceReport | null>(null);
+
+  /* ---- refs (never cause re-renders) ---- */
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const workletRef = useRef<AudioWorkletNode | null>(null);
+  const analyserNode = useRef<AnalyserNode | null>(null);
+  const playbackSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const sessionIdRef = useRef<string>("");
+
+  /* ---- TTS audio queue refs ---- */
+  const audioChunkQueue = useRef<ArrayBuffer[]>([]);
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsBlobUrlRef = useRef<string | null>(null);
+  const ttsMediaSourceRef = useRef<MediaSource | null>(null);
+  const ttsSourceBufferRef = useRef<SourceBuffer | null>(null);
+  const ttsSourceOpenHandlerRef = useRef<(() => void) | null>(null);
+  const ttsStreamDoneRef = useRef(false);
+  const ttsJitterTimerRef = useRef<number | null>(null);
+  const wasUserSpeakingRef = useRef(false);
+
+  /* ---- helpers ---- */
+  const send = useCallback((msg: ClientMessage) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(msg));
+    }
+  }, []);
+
+  /** Clean up any active TTS Blob URL to prevent memory leaks */
+  const revokeTtsBlobUrl = useCallback(() => {
+    if (ttsBlobUrlRef.current) {
+      URL.revokeObjectURL(ttsBlobUrlRef.current);
+      ttsBlobUrlRef.current = null;
+    }
+  }, []);
+
+  const clearTtsJitterTimer = useCallback(() => {
+    if (ttsJitterTimerRef.current !== null) {
+      window.clearTimeout(ttsJitterTimerRef.current);
+      ttsJitterTimerRef.current = null;
+    }
+  }, []);
+
+  const maybeFinalizeTtsStream = useCallback(() => {
+    const mediaSource = ttsMediaSourceRef.current;
+    const sourceBuffer = ttsSourceBufferRef.current;
+    if (!mediaSource || mediaSource.readyState !== "open" || !ttsStreamDoneRef.current) {
+      return;
+    }
+    if (sourceBuffer?.updating) return;
+    if (audioChunkQueue.current.length > 0) return;
+    try {
+      mediaSource.endOfStream();
+    } catch {
+      /* no-op */
+    }
+  }, []);
+
+  const appendNextTtsChunk = useCallback(() => {
+    const sourceBuffer = ttsSourceBufferRef.current;
+    if (!sourceBuffer || sourceBuffer.updating) return;
+    const next = audioChunkQueue.current.shift();
+    if (!next) {
+      maybeFinalizeTtsStream();
+      return;
+    }
+    try {
+      sourceBuffer.appendBuffer(next);
+    } catch (err) {
+      console.error("[VoiceClient] sourceBuffer append error:", err);
+      maybeFinalizeTtsStream();
+    }
+  }, [maybeFinalizeTtsStream]);
+
+  const resetStreamingTtsPlayback = useCallback(
+    (resetSpeaking = true) => {
+      clearTtsJitterTimer();
+      audioChunkQueue.current = [];
+      ttsStreamDoneRef.current = false;
+
+      const audio = ttsAudioRef.current;
+      if (audio) {
+        audio.onended = null;
+        audio.onerror = null;
+        audio.pause();
+        audio.removeAttribute("src");
+        audio.load();
+      }
+
+      const sourceBuffer = ttsSourceBufferRef.current;
+      if (sourceBuffer) {
+        sourceBuffer.removeEventListener("updateend", appendNextTtsChunk);
+        try {
+          if (sourceBuffer.updating) {
+            sourceBuffer.abort();
+          }
+        } catch {
+          /* no-op */
+        }
+      }
+
+      const mediaSource = ttsMediaSourceRef.current;
+      const sourceOpenHandler = ttsSourceOpenHandlerRef.current;
+      if (mediaSource && sourceOpenHandler) {
+        mediaSource.removeEventListener("sourceopen", sourceOpenHandler);
+      }
+      if (mediaSource) {
+        try {
+          if (mediaSource.readyState === "open") {
+            mediaSource.endOfStream();
+          }
+        } catch {
+          /* no-op */
+        }
+      }
+
+      ttsAudioRef.current = null;
+      ttsMediaSourceRef.current = null;
+      ttsSourceBufferRef.current = null;
+      ttsSourceOpenHandlerRef.current = null;
+      revokeTtsBlobUrl();
+
+      if (resetSpeaking) {
+        setIsAiSpeaking(false);
+      }
+    },
+    [appendNextTtsChunk, clearTtsJitterTimer, revokeTtsBlobUrl],
+  );
+
+  const ensureStreamingTtsPlayback = useCallback(() => {
+    if (ttsAudioRef.current || ttsMediaSourceRef.current) return;
+
+    revokeTtsBlobUrl();
+    const mediaSource = new MediaSource();
+    ttsMediaSourceRef.current = mediaSource;
+
+    const url = URL.createObjectURL(mediaSource);
+    ttsBlobUrlRef.current = url;
+
+    const audio = new Audio(url);
+    audio.preload = "auto";
+    ttsAudioRef.current = audio;
+    setIsAiSpeaking(true);
+
+    const handleSourceOpen = () => {
+      if (mediaSource.readyState !== "open") return;
+      try {
+        const sourceBuffer = mediaSource.addSourceBuffer("audio/mpeg");
+        sourceBuffer.mode = "sequence";
+        ttsSourceBufferRef.current = sourceBuffer;
+        sourceBuffer.addEventListener("updateend", appendNextTtsChunk);
+        appendNextTtsChunk();
+      } catch (err) {
+        console.error("[VoiceClient] MediaSource init error:", err);
+        resetStreamingTtsPlayback();
+      }
+    };
+    ttsSourceOpenHandlerRef.current = handleSourceOpen;
+    mediaSource.addEventListener("sourceopen", handleSourceOpen);
+
+    audio.onended = () => {
+      resetStreamingTtsPlayback();
+    };
+
+    audio.onerror = () => {
+      console.error("[VoiceClient] TTS streaming playback error");
+      resetStreamingTtsPlayback();
+    };
+
+    audio.play().catch((e) => {
+      console.error("[VoiceClient] TTS autoplay blocked:", e);
+      resetStreamingTtsPlayback();
+    });
+  }, [appendNextTtsChunk, resetStreamingTtsPlayback, revokeTtsBlobUrl]);
+
+  /**
+   * Barge-in: immediately kill ALL ongoing playback.
+   * Stops both legacy AudioBufferSourceNode playback and streaming TTS.
+   */
+  const handleInterrupt = useCallback(() => {
+    // Stop legacy BufferSource playback
+    try {
+      playbackSourceRef.current?.stop();
+    } catch {
+      /* already stopped */
+    }
+    playbackSourceRef.current = null;
+
+    resetStreamingTtsPlayback();
+  }, [resetStreamingTtsPlayback]);
+
+  /** Decode Base64 audio from backend and play it (legacy single-shot) */
+  const playAudio = useCallback(async (b64: string) => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    try {
+      const raw = base64ToArrayBuffer(b64);
+      const audioBuffer = await ctx.decodeAudioData(raw);
+      handleInterrupt(); // stop previous playback
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+      source.onended = () => {
+        playbackSourceRef.current = null;
+      };
+      playbackSourceRef.current = source;
+      source.start();
+    } catch (e) {
+      console.error("[VoiceClient] playback error", e);
+    }
+  }, [handleInterrupt]);
+
+  /** Route incoming WebSocket messages */
+  const onWsMessage = useCallback(
+    (ev: MessageEvent) => {
+      try {
+        const msg: ServerMessage = JSON.parse(ev.data);
+        switch (msg.type) {
+          case "interrupt":
+            handleInterrupt();
+            break;
+
+          case "audio_playback":
+            playAudio(msg.data);
+            break;
+
+          case "audio_chunk":
+            // Queue incoming TTS bytes and start playback with small jitter buffer.
+            audioChunkQueue.current.push(base64ToArrayBuffer(msg.data));
+            ttsStreamDoneRef.current = false;
+            ensureStreamingTtsPlayback();
+            if (ttsJitterTimerRef.current === null) {
+              ttsJitterTimerRef.current = window.setTimeout(() => {
+                ttsJitterTimerRef.current = null;
+                appendNextTtsChunk();
+              }, 80);
+            }
+            break;
+
+          case "audio_done":
+            // Signal stream completion; flush remaining pending chunks.
+            ttsStreamDoneRef.current = true;
+            appendNextTtsChunk();
+            break;
+
+          case "metadata":
+            setMetadata(msg.data);
+            setIsAiMuted(Boolean(msg.data.is_muted));
+            
+            // Track thinking state transitions
+            if (wasUserSpeakingRef.current && !msg.data.is_user_speaking) {
+              setIsThinking(true);
+            }
+            
+            // Barge-in: ONLY interrupt if:
+            // 1. User just started speaking (transition from false to true)
+            // 2. AI is currently speaking
+            // 3. AI is not muted (human not in control)
+            const userJustStartedSpeaking = msg.data.is_user_speaking && !wasUserSpeakingRef.current;
+            if (userJustStartedSpeaking && isAiSpeaking && !msg.data.is_muted) {
+              console.log("[VoiceClient] Barge-in detected - interrupting AI");
+              setIsThinking(false);
+              handleInterrupt();
+            }
+            
+            wasUserSpeakingRef.current = msg.data.is_user_speaking;
+            
+            // Human takeover immediately silences any in-progress AI speech.
+            if (msg.data.is_muted) {
+              handleInterrupt();
+            }
+            break;
+
+          case "transcript":
+            setTranscript(msg.text);
+            setIsThinking(false);
+            break;
+
+          case "reasoning_update":
+            setReasoning(msg.data);
+            setIsThinking(false);
+            break;
+
+          case "call_summary":
+            setCallSummary(msg.data);
+            break;
+
+          case "state_change":
+            setCallState(msg.state);
+            break;
+
+          case "acoustic_update":
+            setAcousticData(msg.data);
+            break;
+
+          case "error":
+            setError(msg.message);
+            setIsThinking(false);
+            break;
+        }
+      } catch (err) {
+        console.warn("[VoiceClient] unparseable WS message:", err);
+      }
+    },
+    [appendNextTtsChunk, ensureStreamingTtsPlayback, handleInterrupt, playAudio, isAiSpeaking],
+  );
+
+  /* ---- start / stop ---- */
+  const startCall = useCallback(async () => {
+    setError(null);
+    setCallSummary(null);
+
+    /* 1. Mic permission */
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+    } catch {
+      setError("Microphone access denied");
+      return;
+    }
+    streamRef.current = stream;
+
+    /* 2. AudioContext (native sample rate for good visualizer) */
+    const ctx = new AudioContext();
+    audioCtxRef.current = ctx;
+
+    /* 3. Analyser for visualizer */
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.8;
+    analyserNode.current = analyser;
+
+    const source = ctx.createMediaStreamSource(stream);
+    source.connect(analyser);
+
+    /* 4. AudioWorklet for capture */
+    try {
+      await ctx.audioWorklet.addModule("/worklets/audio-capture-processor.js");
+    } catch {
+      setError("AudioWorklet not supported in this browser");
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+
+    const worklet = new AudioWorkletNode(ctx, "audio-capture-processor", {
+      processorOptions: { targetSampleRate: 16000 },
+    });
+
+    /* 5. Session id */
+    const sid = crypto.randomUUID();
+    sessionIdRef.current = sid;
+
+    /* 6. WebSocket */
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${proto}//${window.location.host}/ws/call`;
+    console.log("[VoiceClient] Connecting to WebSocket:", wsUrl);
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log("[VoiceClient] WebSocket connected");
+      setIsConnected(true);
+      send({ type: "start_call", session_id: sid });
+    };
+    ws.onmessage = onWsMessage;
+    ws.onerror = (err) => {
+      console.error("[VoiceClient] WebSocket error:", err);
+      setError("WebSocket connection error");
+    };
+    ws.onclose = (event) => {
+      console.log("[VoiceClient] WebSocket closed:", event.code, event.reason);
+      handleInterrupt();
+      setIsConnected(false);
+      wsRef.current = null;
+    };
+
+    /* 7. Wire worklet → base64 → WS */
+    worklet.port.onmessage = (e) => {
+      if (e.data?.type === "chunk") {
+        const b64 = arrayBufferToBase64(e.data.pcm);
+        send({ type: "audio_chunk", data: b64, session_id: sid });
+      }
+    };
+
+    source.connect(worklet);
+    worklet.connect(ctx.destination); // required to keep worklet alive
+    workletRef.current = worklet;
+
+    setIsRecording(true);
+    setCallActive(true);
+  }, [send, onWsMessage]);
+
+  const stopCall = useCallback(() => {
+    /* signal backend */
+    if (sessionIdRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
+      try {
+        send({ type: "end_call", session_id: sessionIdRef.current });
+      } catch (err) {
+        console.error("[VoiceClient] Error sending end_call:", err);
+      }
+    }
+
+    /* tear down worklet */
+    workletRef.current?.disconnect();
+    workletRef.current = null;
+
+    /* stop mic */
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+
+    /* stop all playback (legacy + TTS) */
+    handleInterrupt();
+
+    /* close audio context */
+    audioCtxRef.current?.close();
+    audioCtxRef.current = null;
+    analyserNode.current = null;
+
+    /* close WebSocket */
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
+    setIsRecording(false);
+    setCallActive(false);
+    setMetadata(null);
+    setCallState("LISTENING");
+    setAcousticData(null);
+    setIsAiMuted(false);
+    setIsThinking(false);
+    wasUserSpeakingRef.current = false;
+  }, [send, handleInterrupt]);
+
+  const toggleTakeover = useCallback(() => {
+    if (!sessionIdRef.current) return;
+    send({ type: "TOGGLE_TAKEOVER", session_id: sessionIdRef.current });
+  }, [send]);
+
+  /* cleanup on unmount */
+  useEffect(() => stopCall, [stopCall]);
+
+  return {
+    isConnected,
+    isRecording,
+    callActive,
+    isAiSpeaking,
+    isAiMuted,
+    isThinking,
+    callState,
+    error,
+    metadata,
+    transcript,
+    reasoning,
+    acousticData,
+    callSummary,
+    startCall,
+    stopCall,
+    toggleTakeover,
+    analyserNode,
+  };
+}
