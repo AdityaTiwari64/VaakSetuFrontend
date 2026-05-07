@@ -50,7 +50,10 @@ export function ComplaintsTable() {
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch("http://localhost:8000/api/complaints");
+      const apiBase = import.meta.env.VITE_API_BASE_URL
+        ? import.meta.env.VITE_API_BASE_URL.replace(/\/$/, "")
+        : "http://localhost:8000";
+      const response = await fetch(`${apiBase}/api/complaints`);
       if (!response.ok) {
         throw new Error(`Request failed with ${response.status}`);
       }
