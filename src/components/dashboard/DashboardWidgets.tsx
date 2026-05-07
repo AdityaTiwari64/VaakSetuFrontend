@@ -144,13 +144,6 @@ export function SentimentWidget({ value }: { value: string }) {
 
 export function UrgencyMeter({ level }: { level: number }) {
   const segments = [1, 2, 3, 4, 5];
-  const colors = [
-    "bg-emerald-500",
-    "bg-lime-500",
-    "bg-amber-500",
-    "bg-orange-500",
-    "bg-rose-500",
-  ];
 
   return (
     <div
