@@ -60,6 +60,11 @@ function StateBadge({ state }: { state: CallState }) {
       icon: <AlertTriangle className="h-3 w-3" />,
       label: "Escalated",
     },
+    WAITING_FOR_LOCATION: {
+      bg: "bg-violet-500/15 border-violet-500/30 text-violet-400",
+      icon: <Users className="h-3 w-3" />,
+      label: "Waiting for Location",
+    },
   };
   const c = config[state];
   return (
