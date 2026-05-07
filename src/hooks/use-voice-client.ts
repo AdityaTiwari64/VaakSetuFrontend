@@ -413,8 +413,10 @@ export function useVoiceClient(): VoiceClientState & VoiceClientActions {
     sessionIdRef.current = sid;
 
     /* 6. WebSocket */
-    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${proto}//${window.location.host}/ws/call`;
+    const wsBaseUrl = import.meta.env.VITE_WS_BASE_URL;
+    const wsUrl = wsBaseUrl
+      ? `${wsBaseUrl.replace(/\/$/, "")}/ws/call`
+      : `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws/call`;
     console.log("[VoiceClient] Connecting to WebSocket:", wsUrl);
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
